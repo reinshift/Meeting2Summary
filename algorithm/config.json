@@ -1,0 +1,27 @@
+{
+    "mode": "test",
+    "data_dir": "../data",
+    "output_dir": "../output",
+    "model_path": "../output/model_epoch_10.pt",
+    "test_wav": "../data/wav/20200706_L_R001S01C01.flac",
+    "output_file": "../output/conversation.txt",
+    "resume_from": "",
+    
+    "input_dim": 80,
+    "speaker_embedding_dim": 192,
+    "hidden_dim": 512,
+    "vocab_size": 5000,
+    "similarity_threshold": 0.75,
+    
+    "segment_length": 48000,
+    "sample_rate": 16000,
+    "batch_size": 16,
+    "num_workers": 2,
+    "learning_rate": 0.0001,
+    "triplet_margin": 0.2,
+    "num_epochs": 50,
+    "save_interval": 5,
+    
+    "log_level": "INFO",
+    "seed": 42
+}
