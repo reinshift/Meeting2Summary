@@ -1,27 +1,51 @@
 {
-    "mode": "test",
-    "data_dir": "../data",
-    "output_dir": "../output",
-    "model_path": "../output/model_epoch_10.pt",
-    "test_wav": "../data/wav/20200706_L_R001S01C01.flac",
-    "output_file": "../output/conversation.txt",
-    "resume_from": "",
-    
-    "input_dim": 80,
-    "speaker_embedding_dim": 192,
-    "hidden_dim": 512,
-    "vocab_size": 5000,
-    "similarity_threshold": 0.75,
-    
-    "segment_length": 48000,
-    "sample_rate": 16000,
+    "data_dir": "data",
+    "output_dir": "algorithm/output",
     "batch_size": 16,
+    "num_epochs": 10,
+    "learning_rate": 5e-4,
+    "weight_decay": 1e-4,
+    "device": "cuda",
+    "save_every": 1,
+    "speaker_threshold": 0.75,
+    "vad_threshold": 0.5,
+    "asr_model_size": "tiny",
     "num_workers": 2,
-    "learning_rate": 0.0001,
-    "triplet_margin": 0.2,
-    "num_epochs": 50,
-    "save_interval": 5,
-    
-    "log_level": "INFO",
-    "seed": 42
+    "pretrained_model_path": null,
+    "random_seed": 42,
+    "training": {
+        "clip_grad_norm": 3.0,
+        "early_stopping_patience": 5,
+        "scheduler_patience": 3,
+        "scheduler_factor": 0.5,
+        "mixup_alpha": 0.2,
+        "use_mixup": false,
+        "use_specaugment": false,
+        "specaugment_config": {
+            "time_mask_param": 30,
+            "freq_mask_param": 10,
+            "num_time_masks": 2,
+            "num_freq_masks": 2
+        }
+    },
+    "model": {
+        "ecapa_tdnn": {
+            "input_size": 80,
+            "channels": 256,
+            "emb_dim": 128
+        },
+        "arcface": {
+            "scale": 30.0,
+            "margin": 0.2
+        }
+    },
+    "features": {
+        "sample_rate": 16000,
+        "n_fft": 512,
+        "win_length": 400,
+        "hop_length": 160,
+        "f_min": 20,
+        "f_max": 7600,
+        "n_mels": 80
+    }
 }

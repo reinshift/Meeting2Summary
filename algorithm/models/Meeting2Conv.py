@@ -1,186 +1,311 @@
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchaudio
 import numpy as np
-from typing import Dict, List, Tuple, Optional
-import os
+import json
+import whisper
+from typing import List, Dict, Tuple, Optional, Union
+from dataclasses import dataclass
+import logging
+from pathlib import Path
 
-class EcapaTDNN(nn.Module):
-    """ECAPA-TDNN模块，用于说话人识别"""
-    def __init__(self, 
-                 input_dim: int = 80, 
-                 channels: List[int] = [512, 512, 512, 512, 1536],
-                 kernel_sizes: List[int] = [5, 3, 3, 3, 1],
-                 dilations: List[int] = [1, 2, 3, 4, 1],
-                 attention_channels: int = 128,
-                 embedding_dim: int = 192):
-        super(EcapaTDNN, self).__init__()
+# 配置日志
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+@dataclass
+class AudioSegment:
+    """音频片段数据类"""
+    start: float  # 开始时间 (秒)
+    end: float    # 结束时间 (秒)
+    audio: torch.Tensor  # 音频数据
+    sr: int       # 采样率
+    speaker_id: Optional[str] = None  # 说话人ID
+    text: Optional[str] = None  # 文本内容
+
+class VAD(nn.Module):
+    """语音活动检测模块，使用预训练模型"""
+    
+    def __init__(self, device=None):
+        super().__init__()
+        self.device = device if device is not None else torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        logger.info(f"正在初始化VAD模块，使用设备: {self.device}")
         
-        self.conv1 = nn.Conv1d(input_dim, channels[0], kernel_size=kernel_sizes[0], dilation=dilations[0], bias=False)
-        self.bn1 = nn.BatchNorm1d(channels[0])
+        # 使用silero-vad (小型轻量级VAD模型)
+        self.model, utils = torch.hub.load(
+            repo_or_dir='snakers4/silero-vad',
+            model='silero_vad',
+            force_reload=False,
+            onnx=False
+        )
+        
+        self.model.to(self.device)
+        self.model.eval()
+        
+        # 导入工具函数
+        self.get_speech_timestamps = utils[0]
+        self.save_audio = utils[1]
+        self.read_audio = utils[2]
+        self.vad_collector = utils[3]
+        
+        logger.info("VAD模块初始化完成")
+    
+    def forward(self, audio_path: str, min_speech_duration_ms: int = 250, threshold: float = 0.5) -> List[AudioSegment]:
+        """检测音频中的语音段"""
+        logger.info(f"正在处理音频文件: {audio_path}")
+        
+        # 读取音频文件
+        audio_tensor, sr = torchaudio.load(audio_path)
+        
+        # 如果是立体声，转换为单声道
+        if audio_tensor.shape[0] > 1:
+            audio_tensor = torch.mean(audio_tensor, dim=0, keepdim=True)
+        
+        # 如果采样率不是16kHz，进行重采样
+        if sr != 16000:
+            resampler = torchaudio.transforms.Resample(orig_freq=sr, new_freq=16000)
+            audio_tensor = resampler(audio_tensor)
+            sr = 16000
+        
+        # 将音频移动到设备上
+        audio_tensor = audio_tensor.to(self.device)
+        
+        # 获取语音时间戳
+        speech_timestamps = self.get_speech_timestamps(
+            audio_tensor[0],
+            self.model,
+            threshold=threshold,
+            min_speech_duration_ms=min_speech_duration_ms,
+            return_seconds=False
+        )
+        
+        # 创建AudioSegment对象列表
+        segments = []
+        for ts in speech_timestamps:
+            start_sample, end_sample = ts['start'], ts['end']
+            start_time = start_sample / sr
+            end_time = end_sample / sr
+            
+            # 提取该段音频
+            segment_audio = audio_tensor[:, start_sample:end_sample]
+            
+            segments.append(AudioSegment(
+                start=start_time,
+                end=end_time,
+                audio=segment_audio,
+                sr=sr
+            ))
+        
+        logger.info(f"检测到 {len(segments)} 个语音段")
+        return segments
+
+
+class ECAPA_TDNN(nn.Module):
+    """基于ECAPA-TDNN架构的说话人识别模型"""
+    
+    def __init__(self, input_size=80, channels=512, emb_dim=192):
+        super().__init__()
+        
+        self.conv1 = nn.Conv1d(input_size, channels, kernel_size=5, stride=1, padding=2)
         self.relu = nn.ReLU()
+        self.bn1 = nn.BatchNorm1d(channels)
         
-        # SE-Res2Net 块
-        self.layers = nn.ModuleList()
-        for i in range(1, len(channels) - 1):
-            self.layers.append(
-                nn.Sequential(
-                    nn.Conv1d(channels[i-1], channels[i], kernel_size=kernel_sizes[i], dilation=dilations[i], bias=False),
-                    nn.BatchNorm1d(channels[i]),
-                    nn.ReLU(),
-                    SEModule(channels[i], 8)
-                )
+        # SE-Res2Block 1
+        self.res1 = SERes2Block(channels, channels, kernel_size=3, stride=1, padding=1)
+        
+        # SE-Res2Block 2
+        self.res2 = SERes2Block(channels, channels, kernel_size=3, stride=1, padding=1)
+        
+        # SE-Res2Block 3
+        self.res3 = SERes2Block(channels, channels, kernel_size=3, stride=1, padding=1)
+        
+        # Attentive Statistics Pooling
+        self.asp = AttentiveStatsPool(channels, attention_channels=128)
+        
+        # Final embedding layer
+        self.fc = nn.Linear(channels * 2, emb_dim)
+        self.bn2 = nn.BatchNorm1d(emb_dim)
+        
+    def forward(self, x):
+        # 输入x可能的形状:
+        # 1. [batch, time, freq]
+        # 2. [batch, time, channel, freq]
+        
+        # 检查输入维度，如果是4D，则合并通道维度（取平均值）
+        if x.dim() == 4:
+            # x形状为[batch, time, channel, freq]
+            # 在通道维度上取平均值
+            x = torch.mean(x, dim=2)  # 结果形状为[batch, time, freq]
+        
+        # 转换为 [batch, freq, time] 以适配卷积层
+        x = x.transpose(1, 2)
+        
+        x = self.conv1(x)
+        x = self.relu(x)
+        x = self.bn1(x)
+        
+        x = self.res1(x)
+        x = self.res2(x)
+        x = self.res3(x)
+        
+        x = self.asp(x)
+        x = self.fc(x)
+        x = self.bn2(x)
+        
+        # L2 归一化，添加数值稳定性保护
+        eps = 1e-8
+        norm = torch.norm(x, p=2, dim=1, keepdim=True).clamp(min=eps)
+        x = x / norm
+        
+        return x
+
+
+class SERes2Block(nn.Module):
+    """具有Squeeze-Excitation的Res2Net块"""
+    
+    def __init__(self, in_channels, out_channels, kernel_size=3, stride=1, padding=1, scale=8, se_ratio=16):
+        super().__init__()
+        
+        self.scale = scale
+        width = in_channels // scale
+        
+        self.conv1 = nn.Conv1d(in_channels, in_channels, kernel_size=1)
+        self.bn1 = nn.BatchNorm1d(in_channels)
+        
+        self.nums = scale - 1
+        convs = []
+        bns = []
+        for i in range(self.nums):
+            convs.append(nn.Conv1d(width, width, kernel_size=kernel_size, stride=stride, padding=padding))
+            bns.append(nn.BatchNorm1d(width))
+        self.convs = nn.ModuleList(convs)
+        self.bns = nn.ModuleList(bns)
+        
+        self.conv3 = nn.Conv1d(in_channels, out_channels, kernel_size=1)
+        self.bn3 = nn.BatchNorm1d(out_channels)
+        
+        self.se = SE_Block(out_channels, ratio=se_ratio)
+        
+        self.relu = nn.ReLU()
+        self.width = width
+        
+        if in_channels != out_channels:
+            self.shortcut = nn.Sequential(
+                nn.Conv1d(in_channels, out_channels, kernel_size=1),
+                nn.BatchNorm1d(out_channels)
             )
+        else:
+            self.shortcut = nn.Identity()
+            
+    def forward(self, x):
+        residual = self.shortcut(x)
         
-        # 注意力统计池化
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu(out)
+        
+        spx = torch.split(out, self.width, 1)
+        for i in range(self.nums):
+            if i == 0:
+                sp = spx[i]
+            else:
+                sp = sp + spx[i]
+            sp = self.convs[i](sp)
+            sp = self.bns[i](sp)
+            sp = self.relu(sp)
+            if i == 0:
+                out = sp
+            else:
+                out = torch.cat((out, sp), 1)
+        
+        out = torch.cat((out, spx[self.scale-1]), 1)
+        
+        out = self.conv3(out)
+        out = self.bn3(out)
+        
+        out = self.se(out)
+        
+        out += residual
+        out = self.relu(out)
+        
+        return out
+
+
+class SE_Block(nn.Module):
+    """压缩激励(Squeeze-Excitation)模块"""
+    
+    def __init__(self, channel, ratio=16):
+        super().__init__()
+        
+        self.squeeze = nn.AdaptiveAvgPool1d(1)
+        self.excitation = nn.Sequential(
+            nn.Linear(channel, channel // ratio, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(channel // ratio, channel, bias=False),
+            nn.Sigmoid()
+        )
+        
+    def forward(self, x):
+        b, c, _ = x.size()
+        y = self.squeeze(x).view(b, c)
+        y = self.excitation(y).view(b, c, 1)
+        return x * y.expand_as(x)
+
+
+class AttentiveStatsPool(nn.Module):
+    """注意力统计池化层"""
+    
+    def __init__(self, in_dim, attention_channels=128):
+        super().__init__()
+        
         self.attention = nn.Sequential(
-            nn.Conv1d(channels[-2], attention_channels, kernel_size=1),
+            nn.Conv1d(in_dim, attention_channels, kernel_size=1),
             nn.ReLU(),
             nn.BatchNorm1d(attention_channels),
-            nn.Conv1d(attention_channels, channels[-2], kernel_size=1),
+            nn.Conv1d(attention_channels, in_dim, kernel_size=1),
             nn.Softmax(dim=2)
         )
         
-        # 最终的线性层 - 修复输入通道数
-        # 由于注意力统计池化后通道数翻倍(mu和sg拼接)，所以输入通道数是channels[-2]*2
-        self.final_conv = nn.Conv1d(channels[-2]*2, channels[-1], kernel_size=kernel_sizes[-1], dilation=dilations[-1])
-        self.final_bn = nn.BatchNorm1d(channels[-1])
-        self.embedding = nn.Linear(channels[-1], embedding_dim)
-        
     def forward(self, x):
-        # 输入 x 的形状: [batch, time, freq]
-        x = x.transpose(1, 2)  # [batch, freq, time]
+        # x: [batch, channels, time]
+        eps = 1e-5  # 添加一个小的常数以确保数值稳定性
         
-        x = self.conv1(x)
-        x = self.relu(self.bn1(x))
+        attention_weights = self.attention(x)
         
-        # 添加残差连接时确保维度匹配
-        for layer in self.layers:
-            # 保存原始x，用于后续残差连接
-            residual = x
-            # 通过当前层
-            layer_output = layer(x)
-            
-            # 确保残差连接的维度匹配
-            if residual.size(2) != layer_output.size(2):
-                # 使用插值调整时间维度
-                residual = F.interpolate(residual, size=layer_output.size(2), mode='linear')
-            
-            # 残差连接
-            x = residual + layer_output
+        # 应用注意力权重
+        weighted_x = x * attention_weights
         
-        # 注意力统计池化 - 修复数值稳定性问题
-        w = self.attention(x)
-        mu = torch.sum(x * w, dim=2)
+        # 计算统计量
+        mean = torch.sum(weighted_x, dim=2, keepdim=True)
         
-        # 添加一个小的epsilon值确保平方根内的值为正数
-        epsilon = 1e-6
-        var = torch.clamp(torch.sum(x**2 * w, dim=2) - mu**2, min=epsilon)
-        sg = torch.sqrt(var)
+        # 使用更稳定的方法计算标准差
+        # 原始: std = torch.sqrt(torch.sum(weighted_x ** 2, dim=2, keepdim=True) - mean ** 2)
+        # 问题: 当 mean 很大时，mean^2 可能会导致数值不稳定
         
-        x = torch.cat((mu, sg), dim=1)  # 将通道数翻倍 [batch, channels*2]
+        # 更稳定的计算方式:
+        var = torch.sum(weighted_x ** 2, dim=2, keepdim=True) - mean ** 2
+        # 确保方差不为负（由于数值精度问题可能出现）
+        var = torch.clamp(var, min=eps)
+        std = torch.sqrt(var)
         
-        # 确保x的形状正确
-        x = x.unsqueeze(-1)  # [batch, channels*2, 1]
-        x = self.final_conv(x)  # 现在final_conv接受channels*2个输入通道
-        x = self.relu(self.final_bn(x)).squeeze(-1)
-        x = self.embedding(x)
+        # 拼接均值和标准差
+        pooled = torch.cat([mean, std], dim=1)
+        pooled = pooled.view(pooled.shape[0], -1)
         
-        return F.normalize(x, p=2, dim=1)  # L2归一化
+        return pooled
 
-class SEModule(nn.Module):
-    """压缩激励模块"""
-    def __init__(self, channels, reduction=8):
-        super(SEModule, self).__init__()
-        self.avg_pool = nn.AdaptiveAvgPool1d(1)
-        self.fc1 = nn.Linear(channels, channels // reduction, bias=False)
-        self.relu = nn.ReLU(inplace=True)
-        self.fc2 = nn.Linear(channels // reduction, channels, bias=False)
-        self.sigmoid = nn.Sigmoid()
 
-    def forward(self, x):
-        batch_size, channels, _ = x.size()
-        y = self.avg_pool(x).view(batch_size, channels)
-        y = self.relu(self.fc1(y))
-        y = self.sigmoid(self.fc2(y)).view(batch_size, channels, 1)
-        return x * y
-
-class ASRModule(nn.Module):
-    """语音识别模块，将语音转换为文本"""
-    def __init__(self, 
-                 input_dim: int = 80,
-                 hidden_dim: int = 512,
-                 num_layers: int = 3,
-                 vocab_size: int = 5000):
-        super(ASRModule, self).__init__()
+class SpeakerRecognition(nn.Module):
+    """说话人识别模块"""
+    
+    def __init__(self, device=None, threshold=0.5):
+        super().__init__()
+        self.device = device if device is not None else torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        logger.info(f"正在初始化说话人识别模块，使用设备: {self.device}")
         
-        self.conv = nn.Sequential(
-            nn.Conv2d(1, 32, kernel_size=(3, 3), stride=(2, 2), padding=1),
-            nn.BatchNorm2d(32),
-            nn.ReLU(),
-            nn.Conv2d(32, 64, kernel_size=(3, 3), stride=(2, 2), padding=1),
-            nn.BatchNorm2d(64),
-            nn.ReLU()
-        )
-        
-        # 修正LSTM输入维度计算逻辑
-        self.input_dim = input_dim
-        # 卷积后的频率维度
-        freq_dim = input_dim // 4  # 经过两次stride=2的下采样
-        self.lstm_input_dim = 64 * freq_dim  # 64是最后一个卷积的通道数
-        
-        self.lstm = nn.LSTM(
-            input_size=self.lstm_input_dim,
-            hidden_size=hidden_dim,
-            num_layers=num_layers,
-            bidirectional=True,
-            batch_first=True,
-            dropout=0.2
-        )
-        
-        self.fc = nn.Linear(hidden_dim * 2, vocab_size)  # 双向LSTM
-        
-    def forward(self, x):
-        """
-        处理变长序列的前向传播
-        输入 x 的形状: [batch, time, freq]
-        """
-        batch_size, time_steps, freq = x.size()
-        
-        # 步骤1: 通过卷积层处理
-        x = x.unsqueeze(1)  # [batch, channel=1, time, freq]
-        x = self.conv(x)  # [batch, channels, time/4, freq/4]
-        
-        # 为避免维度不匹配，我们使用自适应池化固定输出时间维度
-        _, channels, _, conv_freq = x.size()
-        
-        # 使用自适应池化将时间维度统一为固定值16，避免不同批次间的维度不一致
-        x = F.adaptive_avg_pool2d(x, (16, conv_freq))  # 统一时间步为16
-        
-        # 重塑为LSTM输入
-        x = x.permute(0, 2, 1, 3).contiguous()  # [batch, 16, channels, freq/4]
-        x = x.view(batch_size, 16, -1)  # [batch, 16, channels*freq/4]
-        
-        # 通过LSTM处理
-        x, _ = self.lstm(x)  # [batch, 16, hidden_dim*2]
-        
-        # 通过全连接层映射到词汇表
-        x = self.fc(x)  # [batch, 16, vocab_size]
-        
-        return x  # [batch, 16, vocab_size]
-
-class Meeting2Conv(nn.Module):
-    """会话转换模型，包含说话人识别和语音转文本模块"""
-    def __init__(self, 
-                 input_dim: int = 80,
-                 speaker_embedding_dim: int = 192,
-                 hidden_dim: int = 512,
-                 vocab_size: int = 5000,
-                 similarity_threshold: float = 0.75):
-        super(Meeting2Conv, self).__init__()
-        
-        # 特征提取器 - 修复参数
+        # 特征提取
         self.feature_extractor = torchaudio.transforms.MelSpectrogram(
             sample_rate=16000,
             n_fft=512,
@@ -188,244 +313,286 @@ class Meeting2Conv(nn.Module):
             hop_length=160,
             f_min=20,
             f_max=7600,
-            n_mels=input_dim
+            n_mels=80
         )
         
-        self.to_db = torchaudio.transforms.AmplitudeToDB()
-        self.input_dim = input_dim
+        # ECAPA-TDNN模型
+        self.model = ECAPA_TDNN(input_size=80, channels=512, emb_dim=192)
+        self.model.to(self.device)
         
-        # 说话人识别模块
-        self.speaker_encoder = EcapaTDNN(
-            input_dim=input_dim,
-            embedding_dim=speaker_embedding_dim
-        )
+        # 说话人嵌入数据库
+        self.speaker_embeddings = {}
+        self.threshold = threshold
         
-        # 语音识别模块
-        self.asr_module = ASRModule(
-            input_dim=input_dim,
-            hidden_dim=hidden_dim,
-            vocab_size=vocab_size
-        )
-        
-        # 说话人聚类参数
-        self.similarity_threshold = similarity_threshold
-        
-        # 词汇表和解码器
-        self.vocab_size = vocab_size
-        # 使用词汇表映射替代占位符
-        self.idx_to_char = self._load_vocabulary()
-        
-    def _load_vocabulary(self):
-        """加载词汇表，或者创建默认映射"""
-        try:
-            # 尝试从文件加载词汇表
-            vocab_path = "../data/vocabulary.txt"
-            if os.path.exists(vocab_path):
-                with open(vocab_path, 'r', encoding='utf-8') as f:
-                    vocab = {}
-                    for i, line in enumerate(f):
-                        word = line.strip()
-                        if word:  # 确保非空行
-                            vocab[i] = word
-                return vocab
-            else:
-                # 如果没有词汇表文件，使用常用中文字符作为默认映射
-                # 这里仅作为示例包含一些常用中文字符
-                common_chars = "的一是在不了有和人这中大为上个国我以要他时来用们生到作地于出就分对成会可主发年动同工也能下过子说产种面而方后多定行学法所民得经十三之进着等部度家电力里如水化高自二理起小物现实加量都两体制机当使点从业本去把性好应开它合还因由其些然前外天政四日那社义事平形相全表间样与关各重新线内数正心反你明看原又么利比或但质气第向道命此变条只没结解问意建月公无系军很情者最立代想已通并提直题党程展五果料象员革位入常文总次品式活设及管特件长求老头基资边流路级少图山统接知较将组见计别她手角期根论运农指几九区强放决西被干做必战先回则任取据处队南给色光门即保治北造百规热领七海口东导器压志世金增争济阶油思术极交受联什认六共权收证改清己美再采转更单风切打白教速花带安场身车例真务具万每目至达走积示议声报斗完类八离华名确才科张信马节话米整空元况今集温传土许步群广石记需段研界拉林律叫且究观越织装影算低持音众书布复容儿须际商非验连断深难近矿千周委素技备半办青省列习响约支般史感劳便团往酸历市克何除消构府称太准精值号率族维划选标写存候毛亲快效斯院查江型眼王按格养易置派层片始却专状育厂京识适属圆包火住调满县局照参红细引听该铁价严龙飞"
-                return {i: char for i, char in enumerate(common_chars)}
-        except Exception as e:
-            print(f"加载词汇表时出错: {str(e)}")
-            # 出错时返回占位符
-            return {i: f"char_{i}" for i in range(self.vocab_size)}
+        logger.info("说话人识别模块初始化完成")
     
-    def extract_features(self, audio: torch.Tensor):
-        """从音频中提取特征"""
-        # 修正特征提取逻辑
-        if audio.dim() == 2:
-            # 如果是批处理，则对每个样本提取特征
-            features = []
-            for a in audio:
-                # 确保音频维度正确
-                if a.dim() == 1:
-                    a = a.unsqueeze(0)  # [1, time]
-                mel_spec = self.feature_extractor(a)  # [1, n_mels, time]
-                mel_spec = self.to_db(mel_spec)  # 转换为分贝
-                
-                # 使用自适应池化确保时间维度一致
-                time_dim = mel_spec.size(2)
-                if time_dim > 1000:  # 如果时间维度太长，则缩短
-                    mel_spec = F.adaptive_avg_pool2d(mel_spec, (mel_spec.size(1), 1000))
-                
-                features.append(mel_spec.squeeze(0).transpose(0, 1))  # [time, n_mels]
+    def _extract_features(self, audio: torch.Tensor, sr: int = 16000) -> torch.Tensor:
+        """从音频中提取梅尔频谱特征"""
+        # 确保音频是单通道的
+        if audio.shape[0] > 1:
+            audio = torch.mean(audio, dim=0, keepdim=True)
             
-            # 找出批次中最短的时间长度
-            min_time_length = min(f.size(0) for f in features)
+        # 重采样到16kHz (如果需要)
+        if sr != 16000:
+            resampler = torchaudio.transforms.Resample(orig_freq=sr, new_freq=16000)
+            audio = resampler(audio)
+        
+        # 提取梅尔频谱图
+        with torch.no_grad():
+            mel_spec = self.feature_extractor(audio)
             
-            # 截断所有特征到相同长度
-            features = [f[:min_time_length] for f in features]
-            
-            return torch.stack(features)  # [batch, time, n_mels]
-        else:
-            # 单个样本
-            if audio.dim() == 1:
-                audio = audio.unsqueeze(0)  # [1, time]
-            mel_spec = self.feature_extractor(audio)  # [1, n_mels, time]
-            mel_spec = self.to_db(mel_spec)  # 转换为分贝
-            
-            # 限制过长的特征
-            time_dim = mel_spec.size(2)
-            if time_dim > 1000:
-                mel_spec = F.adaptive_avg_pool2d(mel_spec, (mel_spec.size(1), 1000))
-                
-            return mel_spec.squeeze(0).transpose(0, 1)  # [time, n_mels]
+        # 对数变换
+        mel_spec = torch.log(mel_spec + 1e-6)
+        
+        # 标准化
+        mean = torch.mean(mel_spec, dim=2, keepdim=True)
+        std = torch.std(mel_spec, dim=2, keepdim=True)
+        mel_spec = (mel_spec - mean) / (std + 1e-6)
+        
+        # 转置为 [time, freq]，去掉批次和通道维度
+        mel_spec = mel_spec.squeeze(0).transpose(0, 1)  # [time, freq]
+        
+        return mel_spec
     
-    def forward(self, audio_segment: torch.Tensor):
-        """
-        前向传播，处理单个音频片段
+    def forward(self, segments: List[AudioSegment]) -> List[AudioSegment]:
+        """为语音片段分配说话人ID"""
+        segments_with_speakers = []
         
-        参数:
-            audio_segment: 音频片段 [batch, time] 或 [time]
+        for segment in segments:
+            # 提取特征
+            features = self._extract_features(segment.audio, segment.sr).to(self.device)
             
-        返回:
-            speaker_embedding: 说话人的嵌入向量
-            asr_output: ASR模块的输出（词汇表上的概率分布）
-        """
-        # 确保输入维度正确
-        if audio_segment.dim() == 1:
-            audio_segment = audio_segment.unsqueeze(0)  # [1, time]
+            # 提取说话人嵌入
+            with torch.no_grad():
+                embedding = self.model(features).cpu().numpy()
             
-        features = self.extract_features(audio_segment)  # [batch, time, freq]
+            # 使用余弦相似度查找最匹配的说话人
+            speaker_id = self._find_best_match(embedding)
+            
+            # 如果是新说话人，则注册
+            if speaker_id is None:
+                speaker_id = f"SPK_{len(self.speaker_embeddings) + 1:03d}"
+                self.speaker_embeddings[speaker_id] = embedding
+                logger.info(f"注册新说话人: {speaker_id}")
+            
+            # 更新片段的说话人ID
+            segment.speaker_id = speaker_id
+            segments_with_speakers.append(segment)
         
-        # 提取说话人特征
-        speaker_embedding = self.speaker_encoder(features)
-        
-        # 语音识别
-        asr_output = self.asr_module(features)
-        
-        return {
-            'speaker_embedding': speaker_embedding,
-            'asr_output': asr_output
-        }
+        return segments_with_speakers
     
-    def identify_speaker(self, speaker_embedding: torch.Tensor, speaker_database: Dict[str, torch.Tensor]):
-        """
-        识别说话人，如果是新说话人则注册
+    def _find_best_match(self, embedding: np.ndarray) -> Optional[str]:
+        """找到最匹配的说话人ID"""
+        if not self.speaker_embeddings:
+            return None
         
-        参数:
-            speaker_embedding: 当前说话人的嵌入向量
-            speaker_database: 已知说话人的数据库
-            
-        返回:
-            speaker_id: 说话人ID
-            is_new: 是否是新说话人
-        """
-        if not speaker_database:
-            # 数据库为空，这是第一个说话人
-            return "SPEAKER_1", True
-            
-        # 计算与已有说话人的相似度
         max_similarity = -1
-        most_similar_id = None
+        best_speaker = None
         
-        for speaker_id, embedding in speaker_database.items():
+        for speaker_id, stored_embedding in self.speaker_embeddings.items():
             # 计算余弦相似度
-            similarity = F.cosine_similarity(speaker_embedding.unsqueeze(0), embedding.unsqueeze(0))
+            similarity = np.sum(embedding * stored_embedding) / (
+                np.sqrt(np.sum(embedding ** 2)) * np.sqrt(np.sum(stored_embedding ** 2))
+            )
+            
             if similarity > max_similarity:
-                max_similarity = similarity.item()  # 转换为Python标量
-                most_similar_id = speaker_id
-                
-        # 降低相似度阈值以更容易识别不同说话人
-        if max_similarity > self.similarity_threshold * 0.85:
-            # 识别为已有说话人
-            return most_similar_id, False
+                max_similarity = similarity
+                best_speaker = speaker_id
+        
+        # 如果相似度高于阈值，返回最佳匹配的说话人
+        if max_similarity > self.threshold:
+            return best_speaker
         else:
-            # 新说话人
-            return f"SPEAKER_{len(speaker_database) + 1}", True
-            
-    def process_meeting(self, audio: torch.Tensor, segment_length: int = 16000*3):
-        """
-        处理完整会议音频，将其转换为对话形式
+            return None
+    
+    def save_embeddings(self, path: str):
+        """保存说话人嵌入到文件"""
+        embeddings_dict = {spk: emb.tolist() for spk, emb in self.speaker_embeddings.items()}
         
-        参数:
-            audio: 完整的音频数据 [time]
-            segment_length: 片段长度（默认3秒）
-            
-        返回:
-            conversation: 会议转写结果，格式为[timestamp]说话人：文本
-        """
-        speaker_database = {}  # 说话人数据库
-        conversation = []
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(embeddings_dict, f, indent=2, ensure_ascii=False)
         
-        # 确保输入是一维的
-        if audio.dim() > 1:
-            audio = audio.squeeze(0)
-            
-        # 通过不同的步长和更多重叠来捕获更多说话人变化
-        # 减少步长以捕获更多的说话人变化点
-        step_size = segment_length // 3  # 更多重叠 (66%)
+        logger.info(f"说话人嵌入已保存到: {path}")
+    
+    def load_embeddings(self, path: str):
+        """从文件加载说话人嵌入"""
+        if not os.path.exists(path):
+            logger.warning(f"嵌入文件不存在: {path}")
+            return
         
-        for i in range(0, len(audio) - segment_length // 2, step_size):
-            segment = audio[i:i+segment_length]
-            if len(segment) < segment_length // 2:
-                # 如果片段太短，就跳过
-                continue
-                
-            # 补齐长度
-            if len(segment) < segment_length:
-                segment = F.pad(segment, (0, segment_length - len(segment)))
-                
-            timestamp = i / 16000  # 假设采样率为16kHz
-            
-            # 降低静音检测阈值以捕获更多的语音片段
-            energy = (segment ** 2).mean().item()
-            if energy < 5e-5:  # 降低静音阈值
-                continue
-                
-            # 处理当前片段
-            outputs = self.forward(segment)
-            speaker_embedding = outputs['speaker_embedding'].squeeze(0)
-            asr_output = outputs['asr_output'].squeeze(0)
-            
-            # 识别说话人
-            speaker_id, is_new = self.identify_speaker(speaker_embedding, speaker_database)
-            
-            # 如果是新说话人，将其添加到数据库
-            if is_new:
-                speaker_database[speaker_id] = speaker_embedding.detach().clone()  # 分离并复制张量
-                
-            # 解码ASR输出为文本
-            text = self._decode_asr_output(asr_output)
-            
-            # 如果有文本，则添加到对话中
-            if text and text.strip():
-                conversation.append(f"[{timestamp:.2f}]{speaker_id}：{text}")
-                
-        return conversation
+        with open(path, 'r', encoding='utf-8') as f:
+            embeddings_dict = json.load(f)
         
-    def _decode_asr_output(self, asr_output):
-        """将ASR输出解码为文本（简化版）"""
-        # 在实际应用中，这里需要使用更复杂的解码算法（如CTC解码）
-        # 或者使用预训练的语言模型进行解码
-        # 这里仅作为示例，简单取argmax
-        indices = torch.argmax(asr_output, dim=-1)
-        
-        # 将索引转换为字符
-        chars = [self.idx_to_char.get(idx.item(), "") for idx in indices if idx.item() > 0]
-        
-        # 合并相同的连续字符（简化CTC解码）
-        text = []
-        for i, char in enumerate(chars):
-            if i == 0 or char != chars[i-1]:
-                text.append(char)
-                
-        return "".join(text)
+        self.speaker_embeddings = {spk: np.array(emb) for spk, emb in embeddings_dict.items()}
+        logger.info(f"已加载 {len(self.speaker_embeddings)} 个说话人嵌入")
 
-def build_model(config):
-    """根据配置构建模型"""
-    return Meeting2Conv(
-        input_dim=config.get('input_dim', 80),
-        speaker_embedding_dim=config.get('speaker_embedding_dim', 192),
-        hidden_dim=config.get('hidden_dim', 512),
-        vocab_size=config.get('vocab_size', 5000),
-        similarity_threshold=config.get('similarity_threshold', 0.75)
-    )
+
+class ASR(nn.Module):
+    """语音识别模块，使用Whisper模型"""
+    
+    def __init__(self, model_size="tiny", device=None):
+        super().__init__()
+        self.device = device if device is not None else torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        logger.info(f"正在初始化ASR模块，使用设备: {self.device}，模型大小: {model_size}")
+        
+        # 加载Whisper模型
+        self.model = whisper.load_model(model_size, device=self.device)
+        
+        logger.info("ASR模块初始化完成")
+    
+    def forward(self, segments: List[AudioSegment]) -> List[AudioSegment]:
+        """为语音片段识别文本"""
+        segments_with_text = []
+        
+        for segment in segments:
+            # 将音频转为numpy数组
+            audio_np = segment.audio.cpu().numpy().squeeze()
+            
+            # 使用Whisper进行识别
+            result = self.model.transcribe(
+                audio_np, 
+                language="zh",  # 指定中文
+                task="transcribe",
+                fp16=False
+            )
+            
+            # 更新片段的文本内容
+            segment.text = result["text"].strip()
+            segments_with_text.append(segment)
+        
+        return segments_with_text
+
+
+class Meeting2Conv(nn.Module):
+    """会议转换为对话格式的混合模型"""
+    
+    def __init__(self, device=None, vad_threshold=0.5, speaker_threshold=0.75, 
+                 asr_model_size="tiny", model_path=None):
+        super().__init__()
+        self.device = device if device is not None else torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        logger.info(f"正在初始化Meeting2Conv模型，使用设备: {self.device}")
+        
+        # 初始化子模块
+        self.vad = VAD(device=self.device)
+        self.speaker_recognition = SpeakerRecognition(device=self.device, threshold=speaker_threshold)
+        self.asr = ASR(model_size=asr_model_size, device=self.device)
+        
+        # 如果提供了模型路径，加载预训练的模型
+        if model_path and os.path.exists(model_path):
+            self.load_model(model_path)
+            logger.info(f"已加载预训练模型: {model_path}")
+        
+        logger.info("Meeting2Conv模型初始化完成")
+    
+    def forward(self, audio_path: str, output_path: str = None) -> List[Dict]:
+        """处理会议音频并生成对话格式文本"""
+        logger.info(f"开始处理会议音频: {audio_path}")
+        
+        # 1. 使用VAD检测语音片段
+        segments = self.vad(audio_path)
+        
+        if not segments:
+            logger.warning("未检测到语音片段")
+            return []
+        
+        # 2. 使用说话人识别为每个片段分配说话人ID
+        segments = self.speaker_recognition(segments)
+        
+        # 3. 使用ASR识别每个片段的文本
+        segments = self.asr(segments)
+        
+        # 4. 将结果整理为对话格式
+        conversation = []
+        for segment in segments:
+            if segment.text:  # 只保留有文本内容的片段
+                dialogue = {
+                    "start_time": f"{int(segment.start // 60):02d}:{int(segment.start % 60):02d}",
+                    "end_time": f"{int(segment.end // 60):02d}:{int(segment.end % 60):02d}",
+                    "speaker_id": segment.speaker_id,
+                    "text": segment.text
+                }
+                conversation.append(dialogue)
+        
+        # 5. 如果指定了输出路径，保存结果
+        if output_path:
+            self._save_conversation(conversation, output_path)
+        
+        logger.info(f"会议处理完成，共生成 {len(conversation)} 条对话")
+        return conversation
+    
+    def _save_conversation(self, conversation: List[Dict], output_path: str):
+        """保存对话到文件"""
+        # 确保输出目录存在
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        
+        # 保存为文本格式
+        with open(output_path, 'w', encoding='utf-8') as f:
+            for utterance in conversation:
+                start_time = utterance["start_time"]
+                speaker_id = utterance["speaker_id"]
+                text = utterance["text"]
+                
+                f.write(f"[{start_time}]-[{speaker_id}]-{text}\n")
+        
+        logger.info(f"对话已保存到: {output_path}")
+    
+    def save_model(self, path: str):
+        """保存模型参数"""
+        # 只保存说话人识别模型的参数
+        torch.save(self.speaker_recognition.model.state_dict(), path)
+        logger.info(f"模型已保存到: {path}")
+        
+        # 保存说话人嵌入
+        embeddings_path = Path(path).with_suffix('.json')
+        self.speaker_recognition.save_embeddings(str(embeddings_path))
+    
+    def load_model(self, path: str):
+        """加载模型参数"""
+        # 加载说话人识别模型的参数
+        self.speaker_recognition.model.load_state_dict(torch.load(path, map_location=self.device))
+        
+        # 加载说话人嵌入
+        embeddings_path = Path(path).with_suffix('.json')
+        if os.path.exists(embeddings_path):
+            self.speaker_recognition.load_embeddings(str(embeddings_path))
+
+# 用于训练说话人识别模型的损失函数
+class ArcFaceLoss(nn.Module):
+    """ArcFace损失函数"""
+    
+    def __init__(self, in_features, out_features, scale=30.0, margin=0.5):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.scale = scale
+        self.margin = margin
+        self.weight = nn.Parameter(torch.FloatTensor(out_features, in_features))
+        nn.init.xavier_uniform_(self.weight)
+        
+    def forward(self, embeddings, label):
+        # 归一化权重和嵌入，确保数值稳定性
+        eps = 1e-8
+        
+        # 使用内置的normalize函数，添加eps参数
+        weight_norm = F.normalize(self.weight, p=2, dim=1, eps=eps)
+        
+        # 计算余弦相似度
+        cos_theta = F.linear(embeddings, weight_norm)
+        
+        # 限制余弦值在有效范围内，留出一点空间避免边界问题
+        cos_theta = cos_theta.clamp(-1 + eps, 1 - eps)
+        
+        # 添加角度边界
+        theta = torch.acos(cos_theta)
+        
+        # 对应标签的角度加上margin
+        target_mask = torch.zeros_like(cos_theta)
+        target_mask.scatter_(1, label.view(-1, 1), 1.0)
+        
+        theta = theta + self.margin * target_mask
+        cos_theta_m = torch.cos(theta)
+        
+        # 应用缩放因子
+        logits = self.scale * cos_theta_m
+        
+        return F.cross_entropy(logits, label)
