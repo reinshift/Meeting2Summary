@@ -1,0 +1,8 @@
+- 使用介绍
+  - [开发流程](pipeline.md)
+  - [快速开始](start.md)
+- 架构介绍
+  - 语音激活检测（VAD）
+  - [说话人识别（SR）](SpeakerRecog.md)
+  - 自动语音识别（ASR）
+  - [数据处理与loss计算](data_loss_cal.md)
