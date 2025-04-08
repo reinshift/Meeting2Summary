@@ -562,12 +562,12 @@ class ArcFaceLoss(nn.Module):
     
     def __init__(self, in_features, out_features, scale=30.0, margin=0.5):
         super().__init__()
-        self.in_features = in_features
-        self.out_features = out_features
-        self.scale = scale
-        self.margin = margin
-        self.weight = nn.Parameter(torch.FloatTensor(out_features, in_features))
-        nn.init.xavier_uniform_(self.weight)
+        self.in_features = in_features # 嵌入维度
+        self.out_features = out_features # 说话人数量
+        self.scale = scale # 缩放因子
+        self.margin = margin # 角度边界
+        self.weight = nn.Parameter(torch.FloatTensor(out_features, in_features)) # 权重
+        nn.init.xavier_uniform_(self.weight) # 行维度为out_features，列维度为in_features，是因为是左乘
         
     def forward(self, embeddings, label):
         # 归一化权重和嵌入，确保数值稳定性
@@ -578,6 +578,8 @@ class ArcFaceLoss(nn.Module):
         
         # 计算余弦相似度
         cos_theta = F.linear(embeddings, weight_norm)
+        # F.linear的作用是将embeddings和weight_norm进行矩阵乘法，
+        # 结果是一个形状为(batch_size, out_features)的矩阵，矩阵的每个元素是embeddings和weight_norm的点积
         
         # 限制余弦值在有效范围内，留出一点空间避免边界问题
         cos_theta = cos_theta.clamp(-1 + eps, 1 - eps)

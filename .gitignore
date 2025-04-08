@@ -1,1 +1,4 @@
 data/
+.obsidian/
+说话人识别.md
+数据集处理与loss计算.md
